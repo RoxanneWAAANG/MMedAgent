@@ -1,107 +1,98 @@
 import os
 import json
-import random
 import argparse
 from dotenv import load_dotenv
 from retry import retry
 from tqdm import tqdm
-import openai
+from openai import OpenAI
+import re
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # System prompt for PMC-LLaMA QA task
 system_message = (
-    "You're a clinical question–answering assistant powered by the PMC-LLaMA model.\n"
-    "When you receive a medical question, you MUST output exactly:\n"
+    "You're a clinical QA assistant using PMC-LLaMA.\n"
+    "Follow this format exactly:\n"
     "Question: <the user's question>\n"
     "Answer:\n"
-    "<thoughts> Why PMC-LLaMA is the right tool and how you'll retrieve evidence.\n"
-    "<actions> [{'tool name':'PMC-LLaMA', 'tool params':{'query':'<the user's question>'}}]\n"
-    "<values> <the final, evidence-based answer>\n"
+    "<thoughts> your reasoning for using PMC-LLaMA\n"
+    "<actions> [{'tool name':'PMC-LLaMA','tool params':{'query':'<question>'}}]\n"
+    "<values> <the answer text>"
 )
 
-# Pool of user question templates
-user_templates = [
-    "What are the primary risk factors for {disease}?",
-    "How does {drug} work to treat {condition}?",
-    "What is the long-term prognosis of a patient with {condition}?",
-]
-
-# Assistant template showing one shot format
-assistant_template = (
-    "Question: <question>\n\n"
-    "Answer:\n\n"
-    "<thoughts> I will search PubMed via PMC-LLaMA to gather authoritative sources.\n\n"
-    "<actions> [{'tool name':'PMC-LLaMA','tool params':{'query':'<question>'}}]\n\n"
-    "<values> <value>\n"
-)
-
-# Simple sampler for variables used in templates
-def sample_vars():
-    return {
-        "disease": random.choice(["diabetes", "hypertension", "COPD"]),
-        "drug": random.choice(["aspirin", "metformin", "lisinopril"]),
-        "condition": random.choice(["heart failure", "asthma", "chronic kidney disease"]),
-    }
-
-# Retry wrapper for rate-limit errors
-@retry(openai.error.RateLimitError, tries=3, delay=2, backoff=2)
-def call_gpt4o(messages):
-    response = openai.ChatCompletion.create(
-        model="o4-mini-2025-04-16",
+@retry(Exception, tries=3, delay=2, backoff=2)
+def call_model(messages):
+    resp = client.chat.completions.create(
+        model="gpt-4o",
         messages=messages,
         temperature=0.8,
-        max_tokens=512,
-        top_p=0.95,
-        frequency_penalty=0,
-        presence_penalty=0,
+        max_tokens=512
     )
-    return response["choices"][0]["message"]["content"]
+    return resp.choices[0].message.content
 
-# Build one instruction sample (3 warm-ups + final)
-def process_one():
-    vars = sample_vars()
-    # Start with system message
-    messages = [{"role": "system", "content": system_message}]
-    # Add 3 warm-up examples
-    for _ in range(3):
-        question = random.choice(user_templates).format(**vars)
-        assistant_shot = assistant_template.replace("<question>", question).replace("<value>", "…")
-        messages.extend([
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": assistant_shot}
-        ])
-    # Final user query
-    final_question = random.choice(user_templates).format(**vars)
-    messages.append({"role": "user", "content": final_question})
+# Build one conversation entry from a QA pair
+def process_one(idx, entry):
+    question = entry['input'].strip()
+    # Assemble messages: system + one-shot
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": question}
+    ]
+    # Call the model to get chain
+    chain = call_model(messages)
 
-    # Call the model to get the chain
-    chain = call_gpt4o(messages)
+    # Parse chain into components
+    thoughts_match = re.search(r"<thoughts>(.*?)<actions>", chain, re.S)
+    actions_match = re.search(r"<actions>(.*?)<values>", chain, re.S)
+    values_match = re.search(r"<values>(.*)", chain, re.S)
+    thoughts = thoughts_match.group(1).strip() if thoughts_match else ""
+    actions_str = actions_match.group(1).strip() if actions_match else "[]"
+    try:
+        actions = json.loads(actions_str.replace("'", '"'))
+    except:
+        actions = []
+    answer = values_match.group(1).strip() if values_match else ""
+
+    # Simulate tool output placeholder
+    tool_output = {"answer": answer}
+
     return {
-        "task": "QA",
-        "user": final_question,
-        "chain": chain
+        "id": idx,
+        "instruction": entry.get('instruction', ''),
+        "conversations": [
+            {"from": "human", "value": question},
+            {"from": "gpt", "thoughts": thoughts, "actions": actions, "value": "Calling PMC-LLaMA..."},
+            {"from": "human", "value": f"PMC-LLaMA output: {json.dumps(tool_output)}\n\n"},
+            {"from": "gpt", "thoughts": "Based on the retrieved answer, here is the medical advice.", "actions": [], "value": answer}
+        ]
     }
 
-# Main entry: generate N examples and save to JSON
-def main(output_path: str, total_num: int):
-    # Set API key
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    if not openai.api_key:
-        raise RuntimeError("OPENAI_API_KEY not found in environment.")
+# Main: read QA pairs from file and generate output
+def main(input_path, output_path, total):
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Missing OPENAI_API_KEY")
+
+    # Load QA entries
+    with open(input_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # Limit to total entries if specified
+    data = data[:total]
 
     results = []
-    for _ in tqdm(range(total_num), desc="Generating QA examples"):
-        results.append(process_one())
+    for i, entry in enumerate(tqdm(data, desc="Processing QA pairs")):
+        results.append(process_one(i, entry))
 
     # Write output file
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate QA instruction data using PMC-LLaMA.")
-    parser.add_argument("--output", type=str, default="qa_instruct_pmcllama.json", help="Output JSON file path.")
-    parser.add_argument("--total_num", type=int, default=50, help="Number of examples to generate.")
-    args = parser.parse_args()
-    main(args.output, args.total_num)
+if __name__=="__main__":
+    p = argparse.ArgumentParser(description="Generate PMC-LLaMA Instruction Turning Dataset.")
+    p.add_argument("--input", required=True, help="Path to JSON file with QA pairs.")
+    p.add_argument("--output", required=True, help="Output JSON file path.")
+    p.add_argument("--total_num", type=int, default=50, help="Number of examples to process.")
+    args = p.parse_args()
+    main(args.input, args.output, args.total_num)
